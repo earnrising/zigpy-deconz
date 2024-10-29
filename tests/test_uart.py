@@ -4,8 +4,12 @@ import logging
 from unittest import mock
 
 import pytest
-import serial_asyncio
-from zigpy.config import CONF_DEVICE_PATH
+from zigpy.config import (
+    CONF_DEVICE_BAUDRATE,
+    CONF_DEVICE_FLOW_CONTROL,
+    CONF_DEVICE_PATH,
+)
+import zigpy.serial
 
 from zigpy_deconz import uart
 
@@ -25,16 +29,29 @@ async def test_connect(monkeypatch):
         loop.call_soon(protocol.connection_made, None)
         return None, protocol
 
-    monkeypatch.setattr(serial_asyncio, "create_serial_connection", mock_conn)
+    monkeypatch.setattr(zigpy.serial, "create_serial_connection", mock_conn)
 
-    await uart.connect({CONF_DEVICE_PATH: "/dev/null"}, api)
+    await uart.connect(
+        {
+            CONF_DEVICE_PATH: "/dev/null",
+            CONF_DEVICE_BAUDRATE: 115200,
+            CONF_DEVICE_FLOW_CONTROL: None,
+        },
+        api,
+    )
 
 
 def test_send(gw):
-    data = b"\x00"
+    data = b"test"
     gw.send(data)
-    assert gw._transport.write.call_count == 1
-    assert gw._transport.write.called_once_with(data)
+
+    packet = b""
+    packet += b"\xC0"  # END
+    packet += b"test"  # data
+    packet += b"\x40\xFE"  # checksum
+    packet += b"\xC0"  # END
+
+    gw._transport.write.assert_called_once_with(packet)
 
 
 def test_close(gw):

@@ -3,30 +3,46 @@
 from __future__ import annotations
 
 import asyncio
-import binascii
-import enum
-import functools
+import collections
+import itertools
 import logging
-from typing import Any, Callable, Optional
+import sys
+from typing import Any, Callable
 
-import serial
-from zigpy.config import CONF_DEVICE_PATH
-import zigpy.exceptions
-from zigpy.types import APSStatus, Bool, Channels
+if sys.version_info[:2] < (3, 11):
+    from async_timeout import timeout as asyncio_timeout  # pragma: no cover
+else:
+    from asyncio import timeout as asyncio_timeout  # pragma: no cover
+
+from zigpy.datastructures import PriorityLock
+from zigpy.types import (
+    APSStatus,
+    Bool,
+    Channels,
+    KeyData,
+    SerializableBytes,
+    Struct,
+    ZigbeePacket,
+)
 from zigpy.zdo.types import SimpleDescriptor
 
-from zigpy_deconz.exception import APIException, CommandError
+from zigpy_deconz.exception import CommandError, MismatchedResponseError, ParsingError
 import zigpy_deconz.types as t
 import zigpy_deconz.uart
+from zigpy_deconz.utils import restart_forever
 
 LOGGER = logging.getLogger(__name__)
 
+MISMATCHED_RESPONSE_TIMEOUT = 0.5
 COMMAND_TIMEOUT = 1.8
 PROBE_TIMEOUT = 2
-MIN_PROTO_VERSION = 0x010B
+REQUEST_RETRY_DELAYS = (0.5, 1.0, 1.5, None)
+
+FRAME_LENGTH = object()
+PAYLOAD_LENGTH = object()
 
 
-class Status(t.uint8_t, enum.Enum):
+class Status(t.enum8):
     SUCCESS = 0
     FAILURE = 1
     BUSY = 2
@@ -37,36 +53,46 @@ class Status(t.uint8_t, enum.Enum):
     INVALID_VALUE = 7
 
 
-class DeviceState(enum.IntFlag):
-    APSDE_DATA_CONFIRM = 0x04
-    APSDE_DATA_INDICATION = 0x08
-    CONF_CHANGED = 0x10
-    APSDE_DATA_REQUEST_SLOTS_AVAILABLE = 0x20
-
-    @classmethod
-    def deserialize(cls, data) -> tuple["DeviceState", bytes]:
-        """Deserialize DevceState."""
-        state, data = t.uint8_t.deserialize(data)
-        return cls(state), data
-
-    def serialize(self) -> bytes:
-        """Serialize data."""
-        return t.uint8_t(self).serialize()
-
-    @property
-    def network_state(self) -> "NetworkState":
-        """Return network state."""
-        return NetworkState(self & 0x03)
-
-
-class NetworkState(t.uint8_t, enum.Enum):
+class NetworkState2(t.enum2):
     OFFLINE = 0
     JOINING = 1
     CONNECTED = 2
     LEAVING = 3
 
 
-class SecurityMode(t.uint8_t, enum.Enum):
+class DeviceStateFlags(t.bitmap6):
+    APSDE_DATA_CONFIRM = 0b00001
+    APSDE_DATA_INDICATION = 0b000010
+    CONF_CHANGED = 0b000100
+    APSDE_DATA_REQUEST_FREE_SLOTS_AVAILABLE = 0b0001000
+
+
+class DeviceState(t.Struct):
+    network_state: NetworkState2
+    device_state: DeviceStateFlags
+
+
+class FirmwarePlatform(t.enum8):
+    Conbee = 0x05
+    Conbee_II = 0x07
+    Conbee_III = 0x09
+
+
+class FirmwareVersion(t.Struct, t.uint32_t):
+    reserved: t.uint8_t
+    platform: FirmwarePlatform
+    minor: t.uint8_t
+    major: t.uint8_t
+
+
+class NetworkState(t.enum8):
+    OFFLINE = 0
+    JOINING = 1
+    CONNECTED = 2
+    LEAVING = 3
+
+
+class SecurityMode(t.enum8):
     NO_SECURITY = 0x00
     PRECONFIGURED_NETWORK_KEY = 0x01
     NETWORK_KEY_FROM_TC = 0x02
@@ -78,7 +104,7 @@ class ZDPResponseHandling(t.bitmap16):
     NodeDescRsp = 0x0001
 
 
-class Command(t.uint8_t, enum.Enum):
+class CommandId(t.enum8):
     aps_data_confirm = 0x04
     device_state = 0x07
     change_network_state = 0x08
@@ -90,11 +116,11 @@ class Command(t.uint8_t, enum.Enum):
     aps_data_indication = 0x17
     zigbee_green_power = 0x19
     mac_poll = 0x1C
-    add_neighbour = 0x1D
-    simplified_beacon = 0x1F
+    update_neighbor = 0x1D
+    mac_beacon_indication = 0x1F
 
 
-class TXStatus(t.uint8_t, enum.Enum):
+class TXStatus(t.enum8):
     SUCCESS = 0x00
 
     @classmethod
@@ -106,86 +132,7 @@ class TXStatus(t.uint8_t, enum.Enum):
         return status
 
 
-TX_COMMANDS = {
-    Command.add_neighbour: (t.uint16_t, t.uint8_t, t.NWK, t.EUI64, t.uint8_t),
-    Command.aps_data_confirm: (t.uint16_t,),
-    Command.aps_data_indication: (t.uint16_t, t.uint8_t),
-    Command.aps_data_request: (
-        t.uint16_t,
-        t.uint8_t,
-        t.DeconzSendDataFlags,
-        t.DeconzAddressEndpoint,
-        t.uint16_t,
-        t.uint16_t,
-        t.uint8_t,
-        t.LVBytes,
-        t.uint8_t,
-        t.uint8_t,
-        t.NWKList,  # optional
-    ),
-    Command.change_network_state: (t.uint8_t,),
-    Command.device_state: (t.uint8_t, t.uint8_t, t.uint8_t),
-    Command.read_parameter: (t.uint16_t, t.uint8_t, t.Bytes),
-    Command.version: (t.uint32_t,),
-    Command.write_parameter: (t.uint16_t, t.uint8_t, t.Bytes),
-}
-
-RX_COMMANDS = {
-    Command.add_neighbour: ((t.uint16_t, t.uint8_t, t.NWK, t.EUI64, t.uint8_t), True),
-    Command.aps_data_confirm: (
-        (
-            t.uint16_t,
-            DeviceState,
-            t.uint8_t,
-            t.DeconzAddressEndpoint,
-            t.uint8_t,
-            TXStatus,
-            t.uint8_t,
-            t.uint8_t,
-            t.uint8_t,
-            t.uint8_t,
-        ),
-        True,
-    ),
-    Command.aps_data_indication: (
-        (
-            t.uint16_t,
-            DeviceState,
-            t.DeconzAddress,
-            t.uint8_t,
-            t.DeconzAddress,
-            t.uint8_t,
-            t.uint16_t,
-            t.uint16_t,
-            t.LVBytes,
-            t.uint8_t,
-            t.uint8_t,
-            t.uint8_t,
-            t.uint8_t,
-            t.uint8_t,
-            t.uint8_t,
-            t.uint8_t,
-            t.int8s,
-        ),
-        True,
-    ),
-    Command.aps_data_request: ((t.uint16_t, DeviceState, t.uint8_t), True),
-    Command.change_network_state: ((t.uint8_t,), True),
-    Command.device_state: ((DeviceState, t.uint8_t, t.uint8_t), True),
-    Command.device_state_changed: ((DeviceState, t.uint8_t), False),
-    Command.mac_poll: ((t.uint16_t, t.DeconzAddress, t.uint8_t, t.int8s), False),
-    Command.read_parameter: ((t.uint16_t, t.uint8_t, t.Bytes), True),
-    Command.simplified_beacon: (
-        (t.uint16_t, t.uint16_t, t.uint16_t, t.uint8_t, t.uint8_t, t.uint8_t),
-        False,
-    ),
-    Command.version: ((t.uint32_t,), True),
-    Command.write_parameter: ((t.uint16_t, t.uint8_t), True),
-    Command.zigbee_green_power: ((t.LVBytes,), False),
-}
-
-
-class NetworkParameter(t.uint8_t, enum.Enum):
+class NetworkParameter(t.enum8):
     mac_address = 0x01
     nwk_panid = 0x05
     nwk_address = 0x07
@@ -208,27 +155,259 @@ class NetworkParameter(t.uint8_t, enum.Enum):
     app_zdp_response_handling = 0x28
 
 
-NETWORK_PARAMETER_SCHEMA = {
-    NetworkParameter.mac_address: (t.EUI64,),
-    NetworkParameter.nwk_panid: (t.PanId,),
-    NetworkParameter.nwk_address: (t.NWK,),
-    NetworkParameter.nwk_extended_panid: (t.ExtendedPanId,),
-    NetworkParameter.aps_designed_coordinator: (t.uint8_t,),
-    NetworkParameter.channel_mask: (Channels,),
-    NetworkParameter.aps_extended_panid: (t.ExtendedPanId,),
-    NetworkParameter.trust_center_address: (t.EUI64,),
-    NetworkParameter.security_mode: (t.uint8_t,),
-    NetworkParameter.use_predefined_nwk_panid: (Bool,),
-    NetworkParameter.network_key: (t.uint8_t, t.Key),
-    NetworkParameter.link_key: (t.EUI64, t.Key),
-    NetworkParameter.current_channel: (t.uint8_t,),
-    NetworkParameter.permit_join: (t.uint8_t,),
-    NetworkParameter.configure_endpoint: (t.uint8_t, SimpleDescriptor),
-    NetworkParameter.protocol_version: (t.uint16_t,),
-    NetworkParameter.nwk_update_id: (t.uint8_t,),
-    NetworkParameter.watchdog_ttl: (t.uint32_t,),
-    NetworkParameter.nwk_frame_counter: (t.uint32_t,),
-    NetworkParameter.app_zdp_response_handling: (ZDPResponseHandling,),
+class IndexedKey(Struct):
+    index: t.uint8_t
+    key: KeyData
+
+
+class LinkKey(Struct):
+    ieee: t.EUI64
+    key: KeyData
+
+
+class IndexedEndpoint(Struct):
+    index: t.uint8_t
+    descriptor: SimpleDescriptor
+
+
+class UpdateNeighborAction(t.enum8):
+    ADD = 0x01
+
+
+NETWORK_PARAMETER_TYPES = {
+    NetworkParameter.mac_address: (None, t.EUI64),
+    NetworkParameter.nwk_panid: (None, t.PanId),
+    NetworkParameter.nwk_address: (None, t.NWK),
+    NetworkParameter.nwk_extended_panid: (None, t.ExtendedPanId),
+    NetworkParameter.aps_designed_coordinator: (None, t.uint8_t),
+    NetworkParameter.channel_mask: (None, Channels),
+    NetworkParameter.aps_extended_panid: (None, t.ExtendedPanId),
+    NetworkParameter.trust_center_address: (None, t.EUI64),
+    NetworkParameter.security_mode: (None, t.uint8_t),
+    NetworkParameter.configure_endpoint: (t.uint8_t, IndexedEndpoint),
+    NetworkParameter.use_predefined_nwk_panid: (None, Bool),
+    NetworkParameter.network_key: (t.uint8_t, IndexedKey),
+    NetworkParameter.link_key: (t.EUI64, LinkKey),
+    NetworkParameter.current_channel: (None, t.uint8_t),
+    NetworkParameter.permit_join: (None, t.uint8_t),
+    NetworkParameter.protocol_version: (None, t.uint16_t),
+    NetworkParameter.nwk_update_id: (None, t.uint8_t),
+    NetworkParameter.watchdog_ttl: (None, t.uint32_t),
+    NetworkParameter.nwk_frame_counter: (None, t.uint32_t),
+    NetworkParameter.app_zdp_response_handling: (None, ZDPResponseHandling),
+}
+
+
+class Command(Struct):
+    command_id: CommandId
+    seq: t.uint8_t
+    payload: t.Bytes
+
+
+COMMAND_SCHEMAS = {
+    CommandId.update_neighbor: (
+        {
+            "status": Status.SUCCESS,
+            "frame_length": FRAME_LENGTH,
+            "payload_length": PAYLOAD_LENGTH,
+            "action": UpdateNeighborAction,
+            "nwk": t.NWK,
+            "ieee": t.EUI64,
+            "mac_capability_flags": t.uint8_t,
+        },
+        {
+            "status": Status,
+            "frame_length": t.uint16_t,
+            "payload_length": t.uint16_t,
+            "action": UpdateNeighborAction,
+            "nwk": t.NWK,
+            "ieee": t.EUI64,
+            "mac_capability_flags": t.uint8_t,
+        },
+    ),
+    CommandId.aps_data_confirm: (
+        {
+            "status": Status.SUCCESS,
+            "frame_length": FRAME_LENGTH,
+            "payload_length": PAYLOAD_LENGTH,
+        },
+        {
+            "status": Status,
+            "frame_length": t.uint16_t,
+            "payload_length": t.uint16_t,
+            "device_state": DeviceState,
+            "request_id": t.uint8_t,
+            "dst_addr": t.DeconzAddressEndpoint,
+            "src_ep": t.uint8_t,
+            "confirm_status": TXStatus,
+            "reserved1": t.uint8_t,
+            "reserved2": t.uint8_t,
+            "reserved3": t.uint8_t,
+            "reserved4": t.uint8_t,
+        },
+    ),
+    CommandId.aps_data_indication: (
+        {
+            "status": Status.SUCCESS,
+            "frame_length": FRAME_LENGTH,
+            "payload_length": PAYLOAD_LENGTH,
+            "flags": t.DataIndicationFlags,
+        },
+        {
+            "status": Status,
+            "frame_length": t.uint16_t,
+            "payload_length": t.uint16_t,
+            "device_state": DeviceState,
+            "dst_addr": t.DeconzAddress,
+            "dst_ep": t.uint8_t,
+            "src_addr": t.DeconzAddress,
+            "src_ep": t.uint8_t,
+            "profile_id": t.uint16_t,
+            "cluster_id": t.uint16_t,
+            "asdu": t.LongOctetString,
+            "reserved1": t.uint8_t,
+            "reserved2": t.uint8_t,
+            "lqi": t.uint8_t,
+            "reserved3": t.uint8_t,
+            "reserved4": t.uint8_t,
+            "reserved5": t.uint8_t,
+            "reserved6": t.uint8_t,
+            "rssi": t.int8s,
+        },
+    ),
+    CommandId.aps_data_request: (
+        {
+            "status": Status.SUCCESS,
+            "frame_length": FRAME_LENGTH,
+            "payload_length": PAYLOAD_LENGTH,
+            "request_id": t.uint8_t,
+            "flags": t.DeconzSendDataFlags,
+            "dst": t.DeconzAddressEndpoint,
+            "profile_id": t.uint16_t,
+            "cluster_id": t.uint16_t,
+            "src_ep": t.uint8_t,
+            "asdu": t.LongOctetString,
+            "tx_options": t.DeconzTransmitOptions,
+            "radius": t.uint8_t,
+            "relays": t.NWKList,  # optional
+        },
+        {
+            "status": Status,
+            "frame_length": t.uint16_t,
+            "payload_length": t.uint16_t,
+            "device_state": DeviceState,
+            "request_id": t.uint8_t,
+        },
+    ),
+    CommandId.change_network_state: (
+        {
+            "status": Status.SUCCESS,
+            "frame_length": FRAME_LENGTH,
+            # "payload_length": PAYLOAD_LENGTH,
+            "network_state": NetworkState,
+        },
+        {
+            "status": Status,
+            "frame_length": t.uint16_t,
+            # "payload_length": t.uint16_t,
+            "network_state": NetworkState,
+        },
+    ),
+    CommandId.device_state: (
+        {
+            "status": Status.SUCCESS,
+            "frame_length": FRAME_LENGTH,
+            # "payload_length": PAYLOAD_LENGTH,
+            "reserved1": t.uint8_t(0),
+            "reserved2": t.uint8_t(0),
+            "reserved3": t.uint8_t(0),
+        },
+        {
+            "status": Status,
+            "frame_length": t.uint16_t,
+            # "payload_length": t.uint16_t,
+            "device_state": DeviceState,
+            "reserved1": t.uint8_t,
+            "reserved2": t.uint8_t,
+        },
+    ),
+    CommandId.device_state_changed: (
+        None,
+        {
+            "status": Status,
+            "frame_length": t.uint16_t,
+            # "payload_length": t.uint16_t,
+            "device_state": DeviceState,
+            "reserved": t.uint8_t,
+        },
+    ),
+    CommandId.mac_poll: (
+        None,
+        {
+            "status": Status,
+            "frame_length": t.uint16_t,
+            "payload_length": t.uint16_t,
+            "src_addr": t.DeconzAddress,
+            "lqi": t.uint8_t,
+            "rssi": t.int8s,
+            "life_time": t.uint32_t,  # Optional
+            "device_timeout": t.uint32_t,  # Optional
+        },
+    ),
+    CommandId.read_parameter: (
+        {
+            "status": Status.SUCCESS,
+            "frame_length": FRAME_LENGTH,
+            "payload_length": PAYLOAD_LENGTH,
+            "parameter_id": NetworkParameter,
+            "parameter": t.Bytes,
+        },
+        {
+            "status": Status,
+            "frame_length": t.uint16_t,
+            "payload_length": t.uint16_t,
+            "parameter_id": NetworkParameter,
+            "parameter": t.Bytes,
+        },
+    ),
+    CommandId.version: (
+        {
+            "status": Status.SUCCESS,
+            "frame_length": FRAME_LENGTH,
+            # "payload_length": PAYLOAD_LENGTH,
+            "reserved": t.uint32_t(0),
+        },
+        {
+            "status": Status,
+            "frame_length": t.uint16_t,
+            # "payload_length": t.uint16_t,
+            "version": FirmwareVersion,
+        },
+    ),
+    CommandId.write_parameter: (
+        {
+            "status": Status.SUCCESS,
+            "frame_length": FRAME_LENGTH,
+            "payload_length": PAYLOAD_LENGTH,
+            "parameter_id": NetworkParameter,
+            "parameter": t.Bytes,
+        },
+        {
+            "status": Status,
+            "frame_length": t.uint16_t,
+            "payload_length": t.uint16_t,
+            "parameter_id": NetworkParameter,
+        },
+    ),
+    CommandId.zigbee_green_power: (
+        None,
+        {
+            "status": Status,
+            "frame_length": t.uint16_t,
+            "payload_length": t.uint16_t,
+            "reserved": t.LongOctetString,
+        },
+    ),
 }
 
 
@@ -238,20 +417,34 @@ class Deconz:
     def __init__(self, app: Callable, device_config: dict[str, Any]):
         """Init instance."""
         self._app = app
-        self._aps_data_ind_flags: int = 0x01
-        self._awaiting = {}
-        self._command_lock = asyncio.Lock()
+
+        # [seq][cmd_id] = [fut1, fut2, ...]
+        self._awaiting = collections.defaultdict(lambda: collections.defaultdict(list))
+        self._mismatched_response_timers: dict[int, asyncio.TimerHandle] = {}
+        self._command_lock = PriorityLock()
         self._config = device_config
-        self._data_indication: bool = False
-        self._data_confirm: bool = False
-        self._device_state = DeviceState(NetworkState.OFFLINE)
+        self._device_state = DeviceState(
+            network_state=NetworkState2.OFFLINE,
+            device_state=(
+                DeviceStateFlags.APSDE_DATA_CONFIRM
+                | DeviceStateFlags.APSDE_DATA_INDICATION
+            ),
+        )
+
+        self._free_slots_available_event = asyncio.Event()
+        self._free_slots_available_event.set()
+
+        self._data_poller_event = asyncio.Event()
+        self._data_poller_event.set()
+        self._data_poller_task: asyncio.Task | None = None
+
         self._seq = 1
-        self._proto_ver: Optional[int] = None
-        self._firmware_version: Optional[int] = None
-        self._uart: Optional[zigpy_deconz.uart.Gateway] = None
+        self._protocol_version = 0
+        self._firmware_version = FirmwareVersion(0)
+        self._uart: zigpy_deconz.uart.Gateway | None = None
 
     @property
-    def firmware_version(self) -> Optional[int]:
+    def firmware_version(self) -> FirmwareVersion:
         """Return ConBee firmware version."""
         return self._firmware_version
 
@@ -261,248 +454,402 @@ class Deconz:
         return self._device_state.network_state
 
     @property
-    def protocol_version(self) -> Optional[int]:
+    def protocol_version(self) -> int:
         """Protocol Version."""
-        return self._proto_ver
+        return self._protocol_version
 
     async def connect(self) -> None:
         assert self._uart is None
+
         self._uart = await zigpy_deconz.uart.connect(self._config, self)
 
-    def connection_lost(self, exc: Exception) -> None:
-        """Lost serial connection."""
-        LOGGER.debug(
-            "Serial %r connection lost unexpectedly: %r",
-            self._config[CONF_DEVICE_PATH],
-            exc,
-        )
+        try:
+            await self.version()
+            device_state_rsp = await self.send_command(CommandId.device_state)
+        except Exception:
+            await self.disconnect()
+            self._uart = None
+            raise
 
+        self._device_state = device_state_rsp["device_state"]
+
+        self._data_poller_task = asyncio.create_task(self._data_poller())
+
+    def connection_lost(self, exc: Exception | None) -> None:
+        """Lost serial connection."""
         if self._app is not None:
             self._app.connection_lost(exc)
 
-    def close(self):
-        self._app = None
+    async def disconnect(self):
+        if self._data_poller_task is not None:
+            self._data_poller_task.cancel()
+            self._data_poller_task = None
 
         if self._uart is not None:
-            self._uart.close()
+            await self._uart.disconnect()
             self._uart = None
 
-    async def _command(self, cmd, *args):
+        self._app = None
+
+    def _get_command_priority(self, command: Command) -> int:
+        return {
+            # The watchdog is fed using `write_parameter` and `get_device_state` so they
+            # must take priority
+            CommandId.write_parameter: 999,
+            CommandId.device_state: 999,
+            # APS data requests are retried and can be deprioritized
+            CommandId.aps_data_request: -1,
+        }.get(command.command_id, 0)
+
+    async def send_command(self, cmd, **kwargs) -> Any:
+        while True:
+            try:
+                return await self._command(cmd, **kwargs)
+            except MismatchedResponseError as exc:
+                LOGGER.debug("Firmware responded incorrectly (%s), retrying", exc)
+
+    async def _command(self, cmd, **kwargs):
+        payload = []
+        tx_schema, _ = COMMAND_SCHEMAS[cmd]
+        trailing_optional = False
+
+        for name, param_type in tx_schema.items():
+            if isinstance(param_type, int):
+                if name not in kwargs:
+                    # Default value
+                    value = param_type.serialize()
+                else:
+                    value = type(param_type)(kwargs[name]).serialize()
+            elif name in ("frame_length", "payload_length"):
+                value = param_type
+            elif kwargs.get(name) is None:
+                trailing_optional = True
+                value = None
+            elif not isinstance(kwargs[name], param_type):
+                value = param_type(kwargs[name]).serialize()
+            else:
+                value = kwargs[name].serialize()
+
+            if value is None:
+                continue
+
+            if trailing_optional:
+                raise ValueError(
+                    f"Command {cmd} with kwargs {kwargs}"
+                    f" has non-trailing optional argument"
+                )
+
+            payload.append(value)
+
+        if PAYLOAD_LENGTH in payload:
+            payload = t.list_replace(
+                lst=payload,
+                old=PAYLOAD_LENGTH,
+                new=t.uint16_t(
+                    sum(len(p) for p in payload[payload.index(PAYLOAD_LENGTH) + 1 :])
+                ).serialize(),
+            )
+
+        if FRAME_LENGTH in payload:
+            payload = t.list_replace(
+                lst=payload,
+                old=FRAME_LENGTH,
+                new=t.uint16_t(
+                    2 + sum(len(p) if p is not FRAME_LENGTH else 2 for p in payload)
+                ).serialize(),
+            )
+
+        command = Command(
+            command_id=cmd,
+            seq=None,
+            payload=b"".join(payload),
+        )
+
         if self._uart is None:
             # connection was lost
-            raise CommandError(Status.ERROR, "API is not running")
-        async with self._command_lock:
-            LOGGER.debug("Command %s %s", cmd, args)
-            data, seq = self._api_frame(cmd, *args)
-            self._uart.send(data)
+            raise CommandError(
+                "API is not running",
+                status=Status.ERROR,
+                command=command,
+            )
+
+        async with self._command_lock(priority=self._get_command_priority(command)):
+            seq = self._seq
+            self._seq = (self._seq % 255) + 1
+
             fut = asyncio.Future()
-            self._awaiting[seq] = fut
+            self._awaiting[seq][cmd].append(fut)
+
             try:
-                return await asyncio.wait_for(fut, timeout=COMMAND_TIMEOUT)
+                LOGGER.debug("Sending %s%s (seq=%s)", cmd, kwargs, seq)
+                self._uart.send(command.replace(seq=seq).serialize())
+
+                async with asyncio_timeout(COMMAND_TIMEOUT):
+                    return await fut
             except asyncio.TimeoutError:
-                LOGGER.warning(
-                    "No response to '%s' command with seq id '0x%02x'", cmd, seq
-                )
-                self._awaiting.pop(seq, None)
+                LOGGER.debug("No response to '%s' command with seq %d", cmd, seq)
                 raise
+            finally:
+                self._awaiting[seq][cmd].remove(fut)
 
-    def _api_frame(self, cmd, *args):
-        schema = TX_COMMANDS[cmd]
-        d = t.serialize(args, schema)
-        data = t.uint8_t(cmd).serialize()
-        self._seq = (self._seq % 255) + 1
-        data += t.uint8_t(self._seq).serialize()
-        data += t.uint8_t(0).serialize()
-        data += t.uint16_t(len(d) + 5).serialize()
-        data += d
-        return data, self._seq
+    def data_received(self, data: bytes) -> None:
+        command, _ = Command.deserialize(data)
 
-    def data_received(self, data):
-        try:
-            command = Command(data[0])
-            schema, solicited = RX_COMMANDS[command]
-        except ValueError:
-            LOGGER.debug("Unknown command received: 0x%02x", data[0])
+        if command.command_id not in COMMAND_SCHEMAS:
+            LOGGER.warning("Unknown command received: %s", command)
             return
-        seq = data[1]
-        try:
-            status = Status(data[2])
-        except ValueError:
-            status = data[2]
+
+        _, rx_schema = COMMAND_SCHEMAS[command.command_id]
 
         fut = None
-        if solicited and seq in self._awaiting:
-            fut = self._awaiting.pop(seq)
-            if status != Status.SUCCESS:
-                try:
-                    fut.set_exception(
-                        CommandError(status, "%s, status: %s" % (command, status))
-                    )
-                except asyncio.InvalidStateError:
-                    LOGGER.warning(
-                        "Duplicate or delayed response for 0x:%02x sequence", seq
-                    )
-                return
+        wrong_fut_cmd_id = None
 
         try:
-            data, _ = t.deserialize(data[5:], schema)
+            fut = self._awaiting[command.seq][command.command_id][0]
+        except IndexError:
+            # XXX: The firmware can sometimes respond with the wrong response. Find the
+            # future associated with it so we can throw an appropriate error.
+            for cmd_id, futs in self._awaiting[command.seq].items():
+                if futs:
+                    fut = futs[0]
+                    wrong_fut_cmd_id = cmd_id
+                    break
+
+        try:
+            params, rest = t.deserialize_dict(command.payload, rx_schema)
         except Exception:
-            LOGGER.warning("Failed to deserialize frame: %s", binascii.hexlify(data))
+            LOGGER.debug("Failed to parse command %s", command, exc_info=True)
+
             if fut is not None and not fut.done():
                 fut.set_exception(
-                    APIException(
-                        f"Failed to deserialize frame: {binascii.hexlify(data)}"
+                    ParsingError(
+                        f"Failed to parse command: {command}",
+                        status=Status.ERROR,
+                        command=command,
                     )
                 )
+
             return
+
+        if rest:
+            LOGGER.debug("Unparsed data remains after frame: %s, %s", command, rest)
+
+        assert params["frame_length"] == len(data)
+
+        if "payload_length" in params:
+            running_length = itertools.accumulate(
+                len(v.serialize()) if v is not None else 0 for v in params.values()
+            )
+            length_at_param = dict(zip(params.keys(), running_length))
+
+            assert (
+                len(data) - length_at_param["payload_length"] - 2
+                == params["payload_length"]
+            )
+
+        LOGGER.debug(
+            "Received command %s%s (seq %d)", command.command_id, params, command.seq
+        )
+        status = params["status"]
+
+        exc = None
+
+        # Make sure to clear any pending mismatched response timers
+        if command.seq in self._mismatched_response_timers:
+            LOGGER.debug("Clearing existing mismatched response timer")
+            self._mismatched_response_timers.pop(command.seq).cancel()
+
+        if wrong_fut_cmd_id is not None:
+            LOGGER.debug(
+                "Mismatched response, triggering error in %0.2fs",
+                MISMATCHED_RESPONSE_TIMEOUT,
+            )
+            # The firmware *sometimes* responds with the correct response later
+            self._mismatched_response_timers[
+                command.seq
+            ] = asyncio.get_event_loop().call_later(
+                MISMATCHED_RESPONSE_TIMEOUT,
+                fut.set_exception,
+                MismatchedResponseError(
+                    command.command_id,
+                    params,
+                    (
+                        f"Response is mismatched! Sent {wrong_fut_cmd_id},"
+                        f" received {command.command_id}"
+                    ),
+                ),
+            )
+
+            # Make sure we do not resolve the future
+            fut = None
+        elif status != Status.SUCCESS:
+            exc = CommandError(
+                f"{command.command_id}, status: {status}",
+                status=status,
+                command=command,
+            )
 
         if fut is not None:
             try:
-                fut.set_result(data)
+                if exc is None:
+                    fut.set_result(params)
+                else:
+                    fut.set_exception(exc)
             except asyncio.InvalidStateError:
-                LOGGER.warning(
-                    "Duplicate or delayed response for 0x:%02x sequence", seq
+                LOGGER.debug(
+                    "Duplicate or delayed response for seq %s (awaiting %s)",
+                    command.seq,
+                    self._awaiting[command.seq],
                 )
 
-        getattr(self, "_handle_%s" % (command.name,))(data)
+            if exc is not None:
+                return
 
-    add_neighbour = functools.partialmethod(_command, Command.add_neighbour, 12)
-    device_state = functools.partialmethod(_command, Command.device_state, 0, 0, 0)
-    change_network_state = functools.partialmethod(
-        _command, Command.change_network_state
-    )
+        if handler := getattr(self, f"_handle_{command.command_id.name}", None):
+            handler_params = {
+                k: v
+                for k, v in params.items()
+                if k not in ("frame_length", "payload_length")
+            }
 
-    def _handle_device_state(self, data):
-        LOGGER.debug("Device state response: %s", data)
-        self._handle_device_state_value(data[0])
+            # Queue up the callback within the event loop
+            asyncio.get_running_loop().call_soon(lambda: handler(**handler_params))
 
-    def _handle_change_network_state(self, data):
-        LOGGER.debug("Change network state response: %s", NetworkState(data[0]).name)
+    @restart_forever
+    async def _data_poller(self):
+        while True:
+            await self._data_poller_event.wait()
+            self._data_poller_event.clear()
 
-    @classmethod
-    async def probe(cls, device_config: dict[str, Any]) -> bool:
-        """Probe port for the device presence."""
-        api = cls(None, device_config)
-        try:
-            await asyncio.wait_for(api._probe(), timeout=PROBE_TIMEOUT)
-            return True
-        except (asyncio.TimeoutError, serial.SerialException, APIException) as exc:
+            if self._device_state.network_state == NetworkState2.OFFLINE:
+                continue
+
+            # Poll data indication
+            if (
+                DeviceStateFlags.APSDE_DATA_INDICATION
+                in self._device_state.device_state
+            ):
+                # Old Conbee I firmware has an addressing bug for incoming multicasts
+                if (
+                    self.protocol_version >= 0x010B
+                    and self.firmware_version.platform == FirmwarePlatform.Conbee
+                ):
+                    flags = t.DataIndicationFlags.Include_Both_NWK_And_IEEE
+                else:
+                    flags = t.DataIndicationFlags.Always_Use_NWK_Source_Addr
+
+                rsp = await self.send_command(
+                    CommandId.aps_data_indication, flags=flags
+                )
+                self._handle_device_state_changed(
+                    status=rsp["status"], device_state=rsp["device_state"]
+                )
+
+                self._app.packet_received(
+                    ZigbeePacket(
+                        src=rsp["src_addr"].as_zigpy_type(),
+                        src_ep=rsp["src_ep"],
+                        dst=rsp["dst_addr"].as_zigpy_type(),
+                        dst_ep=rsp["dst_ep"],
+                        tsn=None,
+                        profile_id=rsp["profile_id"],
+                        cluster_id=rsp["cluster_id"],
+                        data=SerializableBytes(rsp["asdu"]),
+                        lqi=rsp["lqi"],
+                        rssi=rsp["rssi"],
+                    )
+                )
+
+            # Poll data confirm
+            if DeviceStateFlags.APSDE_DATA_CONFIRM in self._device_state.device_state:
+                rsp = await self.send_command(CommandId.aps_data_confirm)
+
+                self._app.handle_tx_confirm(rsp["request_id"], rsp["confirm_status"])
+                self._handle_device_state_changed(
+                    status=rsp["status"], device_state=rsp["device_state"]
+                )
+
+    def _handle_device_state_changed(
+        self,
+        status: t.Status,
+        device_state: DeviceState,
+        reserved: t.uint8_t = 0,
+    ) -> None:
+        if device_state.network_state != self.network_state:
             LOGGER.debug(
-                "Unsuccessful radio probe of '%s' port",
-                device_config[CONF_DEVICE_PATH],
-                exc_info=exc,
+                "Network device_state transition: %s -> %s",
+                self.network_state.name,
+                device_state.network_state.name,
             )
-        finally:
-            api.close()
 
-        return False
+        if (
+            DeviceStateFlags.APSDE_DATA_REQUEST_FREE_SLOTS_AVAILABLE
+            in device_state.device_state
+        ):
+            self._free_slots_available_event.set()
+        else:
+            self._free_slots_available_event.clear()
 
-    async def _probe(self) -> None:
-        """Open port and try sending a command."""
-        await self.connect()
-        await self.device_state()
-        self.close()
+        self._device_state = device_state
+        self._data_poller_event.set()
 
-    async def read_parameter(self, id_, *args):
-        try:
-            if isinstance(id_, str):
-                param = NetworkParameter[id_]
-            else:
-                param = NetworkParameter(id_)
-        except (KeyError, ValueError):
-            raise KeyError("Unknown parameter id: %s" % (id_,))
-
-        data = t.serialize(args, NETWORK_PARAMETER_SCHEMA[param])
-        r = await self._command(Command.read_parameter, 1 + len(data), param, data)
-        data = t.deserialize(r[2], NETWORK_PARAMETER_SCHEMA[param])[0]
-        LOGGER.debug("Read parameter %s response: %s", param.name, data)
-        return data
-
-    def reconnect(self):
-        """Reconnect using saved parameters."""
-        LOGGER.debug("Reconnecting '%s' serial port", self._config[CONF_DEVICE_PATH])
-        return self.connect()
-
-    def _handle_read_parameter(self, data):
-        pass
-
-    def write_parameter(self, id_, *args):
-        try:
-            if isinstance(id_, str):
-                param = NetworkParameter[id_]
-            else:
-                param = NetworkParameter(id_)
-        except (KeyError, ValueError):
-            raise KeyError("Unknown parameter id: %s write request" % (id_,))
-
-        v = t.serialize(args, NETWORK_PARAMETER_SCHEMA[param])
-        length = len(v) + 1
-        return self._command(Command.write_parameter, length, param, v)
-
-    def _handle_write_parameter(self, data):
-        try:
-            param = NetworkParameter(data[1])
-        except ValueError:
-            LOGGER.error("Received unknown network param id '%s' response", data[1])
-            return
-        LOGGER.debug("Write parameter %s: SUCCESS", param.name)
+    def _handle_device_state(
+        self,
+        status: t.Status,
+        device_state: DeviceState,
+        reserved1: t.uint8_t,
+        reserved2: t.uint8_t,
+    ) -> None:
+        if (
+            self.firmware_version.platform == FirmwarePlatform.Conbee_III
+            and self.firmware_version == 0x26450900
+        ):
+            # Initial Conbee III firmware used the wrong command to notify of network
+            # state changes
+            self._handle_device_state_changed(status=status, device_state=device_state)
 
     async def version(self):
-        (self._proto_ver,) = await self.read_parameter(
+        self._protocol_version = await self.read_parameter(
             NetworkParameter.protocol_version
         )
-        (self._firmware_version,) = await self._command(Command.version, 0)
-        if (
-            self.protocol_version >= MIN_PROTO_VERSION
-            and (self.firmware_version & 0x0000FF00) == 0x00000500
-        ):
-            self._aps_data_ind_flags = 0x04
+
+        version_rsp = await self.send_command(CommandId.version, reserved=0)
+        self._firmware_version = version_rsp["version"]
+
         return self.firmware_version
 
-    def _handle_version(self, data):
-        LOGGER.debug("Version response: %x", data[0])
+    async def read_parameter(
+        self, parameter_id: NetworkParameter, parameter: Any = None
+    ) -> Any:
+        read_param_type, write_param_type = NETWORK_PARAMETER_TYPES[parameter_id]
 
-    def _handle_device_state_changed(self, data):
-        LOGGER.debug("Device state changed response: %s", data)
-        self._handle_device_state_value(data[0])
+        if parameter is None:
+            value = t.Bytes(b"")
+        else:
+            value = read_param_type(parameter).serialize()
 
-    async def _aps_data_indication(self):
-        try:
-            r = await self._command(
-                Command.aps_data_indication, 1, self._aps_data_ind_flags
-            )
-            LOGGER.debug(
-                (
-                    "'aps_data_indication' response from %s, ep: %s, "
-                    "profile: 0x%04x, cluster_id: 0x%04x, data: %s"
-                ),
-                r[4],
-                r[5],
-                r[6],
-                r[7],
-                binascii.hexlify(r[8]),
-            )
-            return r
-        except (asyncio.TimeoutError, zigpy.exceptions.ZigbeeException):
-            pass
-        finally:
-            self._data_indication = False
+        rsp = await self.send_command(
+            CommandId.read_parameter,
+            parameter_id=parameter_id,
+            parameter=value,
+        )
 
-    def _handle_aps_data_indication(self, data):
-        LOGGER.debug("APS data indication response: %s", data)
-        self._data_indication = False
-        self._handle_device_state_value(data[1])
-        if self._app:
-            self._app.handle_rx(
-                data[4],  # src_addr
-                data[5],  # src_ep
-                data[3],  # dst_ep
-                data[6],  # profile_id
-                data[7],  # cluster_id
-                data[8],  # APS payload
-                data[11],  # lqi
-                data[16],
-            )  # rssi
+        assert rsp["parameter_id"] == parameter_id
+
+        result, _ = write_param_type.deserialize(rsp["parameter"])
+        LOGGER.debug("Read parameter %s(%s)=%r", parameter_id.name, parameter, result)
+
+        return result
+
+    async def write_parameter(
+        self, parameter_id: NetworkParameter, parameter: Any
+    ) -> None:
+        read_param_type, write_param_type = NETWORK_PARAMETER_TYPES[parameter_id]
+        await self.send_command(
+            CommandId.write_parameter,
+            parameter_id=parameter_id,
+            parameter=write_param_type(parameter).serialize(),
+        )
 
     async def aps_data_request(
         self,
@@ -516,42 +863,33 @@ class Deconz:
         relays=None,
         tx_options=t.DeconzTransmitOptions.USE_NWK_KEY_SECURITY,
         radius=0,
-    ):
-        dst = dst_addr_ep.serialize()
-        length = len(dst) + len(aps_payload) + 11
-        delays = (0.5, 1.0, 1.5, None)
-
+    ) -> None:
         flags = t.DeconzSendDataFlags.NONE
-        extras = []
 
         # https://github.com/zigpy/zigpy-deconz/issues/180#issuecomment-1017932865
-        if relays:
+        if relays is not None:
             # There is a max of 9 relays
             assert len(relays) <= 9
-
-            # APS ACKs should be used to mitigate errors.
-            tx_options |= t.DeconzTransmitOptions.USE_APS_ACKS
-
             flags |= t.DeconzSendDataFlags.RELAYS
-            extras.append(t.NWKList(relays))
 
-        length += sum(len(e.serialize()) for e in extras)
+        for delay in REQUEST_RETRY_DELAYS:
+            if not self._free_slots_available_event.is_set():
+                LOGGER.debug("Waiting for free slots to become available")
+                await self._free_slots_available_event.wait()
 
-        for delay in delays:
             try:
-                return await self._command(
-                    Command.aps_data_request,
-                    length,
-                    req_id,
-                    flags,
-                    dst_addr_ep,
-                    profile,
-                    cluster,
-                    src_ep,
-                    aps_payload,
-                    tx_options,
-                    radius,
-                    *extras,
+                rsp = await self.send_command(
+                    CommandId.aps_data_request,
+                    request_id=req_id,
+                    flags=flags,
+                    dst=dst_addr_ep,
+                    profile_id=profile,
+                    cluster_id=cluster,
+                    src_ep=src_ep,
+                    asdu=aps_payload,
+                    tx_options=tx_options,
+                    radius=radius,
+                    relays=relays,
                 )
             except CommandError as ex:
                 LOGGER.debug("'aps_data_request' failure: %s", ex)
@@ -560,75 +898,38 @@ class Deconz:
 
                 LOGGER.debug("retrying 'aps_data_request' in %ss", delay)
                 await asyncio.sleep(delay)
+            else:
+                self._handle_device_state_changed(
+                    status=rsp["status"], device_state=rsp["device_state"]
+                )
+                return
 
-    def _handle_aps_data_request(self, data):
-        LOGGER.debug("APS data request response: %s", data)
-        self._handle_device_state_value(data[1])
+    async def get_device_state(self) -> DeviceState:
+        rsp = await self.send_command(CommandId.device_state)
 
-    async def _aps_data_confirm(self):
+        return rsp["device_state"]
+
+    async def change_network_state(self, new_state: NetworkState) -> None:
+        await self.send_command(CommandId.change_network_state, network_state=new_state)
+
+    async def add_neighbour(
+        self, nwk: t.NWK, ieee: t.EUI64, mac_capability_flags: t.uint8_t
+    ) -> None:
         try:
-            r = await self._command(Command.aps_data_confirm, 0)
-            LOGGER.debug(
-                ("Request id: 0x%02x 'aps_data_confirm' for %s, " "status: 0x%02x"),
-                r[2],
-                r[3],
-                r[5],
+            await self.send_command(
+                CommandId.update_neighbor,
+                action=UpdateNeighborAction.ADD,
+                nwk=nwk,
+                ieee=ieee,
+                mac_capability_flags=mac_capability_flags,
             )
-            return r
-        except (asyncio.TimeoutError, zigpy.exceptions.ZigbeeException):
-            pass
-        finally:
-            self._data_confirm = False
+        except ParsingError as exc:
+            # Older Conbee III firmwares send back an invalid response
+            status = Status(exc.command.payload[0])
 
-    def _handle_add_neighbour(self, data) -> None:
-        """Handle add_neighbour response."""
-        LOGGER.debug("add neighbour response: %s", data)
-
-    def _handle_aps_data_confirm(self, data):
-        LOGGER.debug(
-            "APS data confirm response for request with id %s: %02x", data[2], data[5]
-        )
-        self._data_confirm = False
-        self._handle_device_state_value(data[1])
-        self._app.handle_tx_confirm(data[2], data[5])
-
-    def _handle_mac_poll(self, data):
-        pass
-
-    def _handle_zigbee_green_power(self, data):
-        pass
-
-    def _handle_simplified_beacon(self, data):
-        LOGGER.debug(
-            (
-                "Received simplified beacon frame: source=0x%04x, "
-                "pan_id=0x%04x, channel=%s, flags=0x%02x, "
-                "update_id=0x%02x"
-            ),
-            data[1],
-            data[2],
-            data[3],
-            data[4],
-            data[5],
-        )
-
-    def _handle_device_state_value(self, state: DeviceState) -> None:
-        if state.network_state != self.network_state:
-            LOGGER.debug(
-                "Network state transition: %s -> %s",
-                self.network_state.name,
-                state.network_state.name,
-            )
-        self._device_state = state
-        if DeviceState.APSDE_DATA_REQUEST_SLOTS_AVAILABLE not in state:
-            LOGGER.debug("Data request queue full.")
-        if DeviceState.APSDE_DATA_INDICATION in state and not self._data_indication:
-            self._data_indication = True
-            asyncio.create_task(self._aps_data_indication())
-        if DeviceState.APSDE_DATA_CONFIRM in state and not self._data_confirm:
-            self._data_confirm = True
-            asyncio.create_task(self._aps_data_confirm())
-
-    def __getitem__(self, key):
-        """Access parameters via getitem."""
-        return self.read_parameter(key)
+            if status != Status.SUCCESS:
+                raise CommandError(
+                    f"{exc.command.command_id}, status: {status}",
+                    status=status,
+                    command=exc.command,
+                ) from exc

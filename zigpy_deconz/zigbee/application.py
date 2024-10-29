@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import asyncio
-import binascii
-import contextlib
+import importlib.metadata
 import logging
 import re
-import time
+import sys
 from typing import Any
+
+if sys.version_info[:2] < (3, 11):
+    from async_timeout import timeout as asyncio_timeout  # pragma: no cover
+else:
+    from asyncio import timeout as asyncio_timeout  # pragma: no cover
 
 import zigpy.application
 import zigpy.config
@@ -16,7 +20,6 @@ import zigpy.device
 import zigpy.endpoint
 import zigpy.exceptions
 from zigpy.exceptions import FormationFailure, NetworkNotFormed
-import zigpy.neighbor
 import zigpy.state
 import zigpy.types
 import zigpy.util
@@ -26,23 +29,24 @@ import zigpy_deconz
 from zigpy_deconz import types as t
 from zigpy_deconz.api import (
     Deconz,
+    FirmwarePlatform,
+    IndexedEndpoint,
+    IndexedKey,
+    LinkKey,
     NetworkParameter,
     NetworkState,
     SecurityMode,
     Status,
+    TXStatus,
 )
-from zigpy_deconz.config import (
-    CONF_DECONZ_CONFIG,
-    CONF_MAX_CONCURRENT_REQUESTS,
-    CONF_WATCHDOG_TTL,
-    CONFIG_SCHEMA,
-    SCHEMA_DEVICE,
-)
+from zigpy_deconz.config import CONFIG_SCHEMA
 import zigpy_deconz.exception
 
+LIB_VERSION = importlib.metadata.version("zigpy-deconz")
 LOGGER = logging.getLogger(__name__)
 
-CHANGE_NETWORK_WAIT = 1
+CHANGE_NETWORK_POLL_TIME = 1
+CHANGE_NETWORK_STATE_DELAY = 2
 DELAY_NEIGHBOUR_SCAN_S = 1500
 SEND_CONFIRM_TIMEOUT = 60
 
@@ -50,115 +54,133 @@ PROTO_VER_MANUAL_SOURCE_ROUTE = 0x010C
 PROTO_VER_WATCHDOG = 0x0108
 PROTO_VER_NEIGBOURS = 0x0107
 
+CONBEE_III_ENERGY_SCAN_ATTEMPTS = 5
+
 
 class ControllerApplication(zigpy.application.ControllerApplication):
     SCHEMA = CONFIG_SCHEMA
-    SCHEMA_DEVICE = SCHEMA_DEVICE
+
+    _probe_config_variants = [
+        {zigpy.config.CONF_DEVICE_BAUDRATE: 38400},
+        {zigpy.config.CONF_DEVICE_BAUDRATE: 115200},
+    ]
+
+    _watchdog_period = 30
 
     def __init__(self, config: dict[str, Any]):
         """Initialize instance."""
 
-        super().__init__(config=zigpy.config.ZIGPY_SCHEMA(config))
+        super().__init__(config=config)
         self._api = None
 
         self._pending = zigpy.util.Requests()
-        self._concurrent_requests_semaphore = asyncio.Semaphore(
-            self._config[CONF_DECONZ_CONFIG][CONF_MAX_CONCURRENT_REQUESTS]
-        )
-        self._currently_waiting_requests = 0
 
-        self.version = 0
-        self._reset_watchdog_task = None
+        self._delayed_neighbor_scan_task = None
         self._reconnect_task = None
 
         self._written_endpoints = set()
 
-    async def _reset_watchdog(self):
-        while True:
-            try:
-                await self._api.write_parameter(
-                    NetworkParameter.watchdog_ttl, self._config[CONF_WATCHDOG_TTL]
-                )
-            except Exception as e:
-                LOGGER.warning("Failed to reset watchdog", exc_info=e)
-                self.connection_lost(e)
-                return
-
-            await asyncio.sleep(self._config[CONF_WATCHDOG_TTL] * 0.75)
+    async def _watchdog_feed(self):
+        if self._api.protocol_version >= PROTO_VER_WATCHDOG and not (
+            self._api.firmware_version.platform == FirmwarePlatform.Conbee_III
+            and self._api.firmware_version <= 0x26450900
+        ):
+            await self._api.write_parameter(
+                NetworkParameter.watchdog_ttl, int(2 * self._watchdog_period)
+            )
+        else:
+            await self._api.get_device_state()
 
     async def connect(self):
         api = Deconz(self, self._config[zigpy.config.CONF_DEVICE])
-        await api.connect()
-        self.version = await api.version()
+
+        try:
+            await api.connect()
+        except Exception:
+            await api.disconnect()
+            raise
+
         self._api = api
         self._written_endpoints.clear()
 
-    def close(self):
-        if self._reset_watchdog_task is not None:
-            self._reset_watchdog_task.cancel()
-            self._reset_watchdog_task = None
-
-        if self._reconnect_task is not None:
-            self._reconnect_task.cancel()
-            self._reconnect_task = None
+    async def disconnect(self):
+        if self._delayed_neighbor_scan_task is not None:
+            self._delayed_neighbor_scan_task.cancel()
+            self._delayed_neighbor_scan_task = None
 
         if self._api is not None:
-            self._api.close()
+            await self._api.disconnect()
             self._api = None
 
-    async def disconnect(self):
-        self.close()
-
-        if self._api is not None:
-            self._api.close()
-
-    async def permit_with_key(self, node: t.EUI64, code: bytes, time_s=60):
-        raise NotImplementedError()
+    async def permit_with_link_key(self, node: t.EUI64, link_key: t.KeyData, time_s=60):
+        await self._api.write_parameter(
+            NetworkParameter.link_key,
+            LinkKey(ieee=node, key=link_key),
+        )
+        await self.permit(time_s)
 
     async def start_network(self):
         await self.register_endpoints()
         await self.load_network_info(load_devices=False)
-
-        try:
-            await self._change_network_state(NetworkState.CONNECTED)
-        except asyncio.TimeoutError as e:
-            raise FormationFailure() from e
+        await self._change_network_state(NetworkState.CONNECTED)
 
         coordinator = await DeconzDevice.new(
             self,
             self.state.node_info.ieee,
             self.state.node_info.nwk,
-            self.version,
-            self._config[zigpy.config.CONF_DEVICE][zigpy.config.CONF_DEVICE_PATH],
+            self.state.node_info.model,
         )
 
-        coordinator.neighbors.add_context_listener(self._dblistener)
         self.devices[self.state.node_info.ieee] = coordinator
-        if self._api.protocol_version >= PROTO_VER_NEIGBOURS:
+        if self._api.protocol_version >= PROTO_VER_NEIGBOURS and not (
+            self._api.firmware_version.platform == FirmwarePlatform.Conbee_III
+            and self._api.firmware_version < 0x264D0900
+        ):
             await self.restore_neighbours()
-        asyncio.create_task(self._delayed_neighbour_scan())
+
+        self._delayed_neighbor_scan_task = asyncio.create_task(
+            self._delayed_neighbour_scan()
+        )
 
     async def _change_network_state(
-        self, target_state: NetworkState, *, timeout: int = 10 * CHANGE_NETWORK_WAIT
+        self,
+        target_state: NetworkState,
+        *,
+        timeout: int = 10 * CHANGE_NETWORK_POLL_TIME,
     ):
         async def change_loop():
             while True:
-                (state, _, _) = await self._api.device_state()
-                if state.network_state == target_state:
-                    break
-                await asyncio.sleep(CHANGE_NETWORK_WAIT)
+                try:
+                    device_state = await self._api.get_device_state()
+                except asyncio.TimeoutError:
+                    # 0x264B0900 and earlier can reset during device state changes
+                    # requiring a firmware reset, causing state polling to fail
+                    LOGGER.debug("Failed to poll device state")
+                else:
+                    if NetworkState(device_state.network_state) == target_state:
+                        break
+
+                await asyncio.sleep(CHANGE_NETWORK_POLL_TIME)
 
         await self._api.change_network_state(target_state)
-        await asyncio.wait_for(change_loop(), timeout=timeout)
 
-        if self._api.protocol_version < PROTO_VER_WATCHDOG:
-            return
+        try:
+            async with asyncio_timeout(timeout):
+                await change_loop()
+        except asyncio.TimeoutError:
+            if target_state != NetworkState.CONNECTED:
+                raise
 
-        if self._reset_watchdog_task is not None:
-            self._reset_watchdog_task.cancel()
+            raise FormationFailure(
+                "Network formation refused: there is likely too much RF interference."
+                " Make sure your coordinator is on a USB 2.0 extension cable and"
+                " away from any sources of interference, like USB 3.0 ports, SSDs,"
+                " 2.4GHz routers, motherboards, etc."
+            )
 
-        if target_state == NetworkState.CONNECTED:
-            self._reset_watchdog_task = asyncio.create_task(self._reset_watchdog())
+    async def reset_network_info(self):
+        # TODO: There does not appear to be a way to factory reset a Conbee
+        await self.form_network()
 
     async def write_network_info(self, *, network_info, node_info):
         try:
@@ -168,7 +190,8 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         except zigpy_deconz.exception.CommandError as ex:
             assert ex.status == Status.UNSUPPORTED
             LOGGER.warning(
-                "Writing network frame counter is not supported with this firmware"
+                "Writing the network frame counter is not supported with this firmware,"
+                " please update your Conbee"
             )
 
         if node_info.logical_type == zdo_t.LogicalType.Coordinator:
@@ -190,7 +213,7 @@ class ControllerApplication(zigpy.application.ControllerApplication):
             )
             node_ieee = node_info.ieee
         else:
-            (ieee,) = await self._api[NetworkParameter.mac_address]
+            ieee = await self._api.read_parameter(NetworkParameter.mac_address)
             node_ieee = zigpy.types.EUI64(ieee)
 
         # There is no way to specify both a mask and the logical channel
@@ -219,7 +242,8 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         )
 
         await self._api.write_parameter(
-            NetworkParameter.network_key, 0, network_info.network_key.key
+            NetworkParameter.network_key,
+            IndexedKey(index=0, key=network_info.network_key.key),
         )
 
         if network_info.network_key.seq != 0:
@@ -239,89 +263,119 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         )
         await self._api.write_parameter(
             NetworkParameter.link_key,
-            tc_link_key_partner_ieee,
-            network_info.tc_link_key.key,
+            LinkKey(
+                ieee=tc_link_key_partner_ieee,
+                key=network_info.tc_link_key.key,
+            ),
         )
 
-        if network_info.security_level == 0x00:
-            await self._api.write_parameter(
-                NetworkParameter.security_mode, SecurityMode.NO_SECURITY
-            )
-        else:
-            await self._api.write_parameter(
-                NetworkParameter.security_mode, SecurityMode.ONLY_TCLK
-            )
+        if self._api.firmware_version.platform != FirmwarePlatform.Conbee_III:
+            if network_info.security_level == 0x00:
+                await self._api.write_parameter(
+                    NetworkParameter.security_mode, SecurityMode.NO_SECURITY
+                )
+            else:
+                await self._api.write_parameter(
+                    NetworkParameter.security_mode, SecurityMode.ONLY_TCLK
+                )
 
         # Note: Changed network configuration parameters become only affective after
         # sending a Leave Network Request followed by a Create or Join Network Request
         await self._change_network_state(NetworkState.OFFLINE)
+        await asyncio.sleep(CHANGE_NETWORK_STATE_DELAY)
         await self._change_network_state(NetworkState.CONNECTED)
 
     async def load_network_info(self, *, load_devices=False):
         network_info = self.state.network_info
         node_info = self.state.node_info
 
-        network_info.source = f"zigpy-deconz@{zigpy_deconz.__version__}"
-        network_info.metadata = {
-            "deconz": {
-                "version": self.version,
-            }
-        }
-
-        (ieee,) = await self._api[NetworkParameter.mac_address]
+        ieee = await self._api.read_parameter(NetworkParameter.mac_address)
         node_info.ieee = zigpy.types.EUI64(ieee)
-        (designed_coord,) = await self._api[NetworkParameter.aps_designed_coordinator]
+        designed_coord = await self._api.read_parameter(
+            NetworkParameter.aps_designed_coordinator
+        )
 
         if designed_coord == 0x01:
             node_info.logical_type = zdo_t.LogicalType.Coordinator
         else:
             node_info.logical_type = zdo_t.LogicalType.Router
 
-        (node_info.nwk,) = await self._api[NetworkParameter.nwk_address]
+        node_info.nwk = await self._api.read_parameter(NetworkParameter.nwk_address)
 
-        (network_info.pan_id,) = await self._api[NetworkParameter.nwk_panid]
-        (network_info.extended_pan_id,) = await self._api[
+        node_info.manufacturer = "dresden elektronik"
+
+        if re.match(
+            r"/dev/tty(S|AMA|ACM)\d+",
+            self._config[zigpy.config.CONF_DEVICE][zigpy.config.CONF_DEVICE_PATH],
+        ):
+            node_info.model = "Raspbee"
+        else:
+            node_info.model = "Conbee"
+
+        node_info.model += {
+            FirmwarePlatform.Conbee: "",
+            FirmwarePlatform.Conbee_II: " II",
+            FirmwarePlatform.Conbee_III: " III",
+        }[self._api.firmware_version.platform]
+
+        node_info.version = f"{int(self._api.firmware_version):#010x}"
+
+        network_info.source = f"zigpy-deconz@{LIB_VERSION}"
+        network_info.metadata = {
+            "deconz": {
+                "version": node_info.version,
+            }
+        }
+
+        network_info.pan_id = await self._api.read_parameter(NetworkParameter.nwk_panid)
+        network_info.extended_pan_id = await self._api.read_parameter(
             NetworkParameter.aps_extended_panid
-        ]
+        )
 
         if network_info.extended_pan_id == zigpy.types.EUI64.convert(
             "00:00:00:00:00:00:00:00"
         ):
-            (network_info.extended_pan_id,) = await self._api[
+            network_info.extended_pan_id = await self._api.read_parameter(
                 NetworkParameter.nwk_extended_panid
-            ]
+            )
 
-        (network_info.channel,) = await self._api[NetworkParameter.current_channel]
-        (network_info.channel_mask,) = await self._api[NetworkParameter.channel_mask]
-        (network_info.nwk_update_id,) = await self._api[NetworkParameter.nwk_update_id]
+        network_info.channel = await self._api.read_parameter(
+            NetworkParameter.current_channel
+        )
+        network_info.channel_mask = await self._api.read_parameter(
+            NetworkParameter.channel_mask
+        )
+        network_info.nwk_update_id = await self._api.read_parameter(
+            NetworkParameter.nwk_update_id
+        )
 
         if network_info.channel == 0:
             raise NetworkNotFormed("Network channel is zero")
 
+        indexed_key = await self._api.read_parameter(NetworkParameter.network_key, 0)
+
         network_info.network_key = zigpy.state.Key()
-        (
-            _,
-            network_info.network_key.key,
-        ) = await self._api.read_parameter(NetworkParameter.network_key, 0)
+        network_info.network_key.key = indexed_key.key
 
         try:
-            (network_info.network_key.tx_counter,) = await self._api[
+            network_info.network_key.tx_counter = await self._api.read_parameter(
                 NetworkParameter.nwk_frame_counter
-            ]
+            )
         except zigpy_deconz.exception.CommandError as ex:
             assert ex.status == Status.UNSUPPORTED
 
         network_info.tc_link_key = zigpy.state.Key()
-        (network_info.tc_link_key.partner_ieee,) = await self._api[
+        network_info.tc_link_key.partner_ieee = await self._api.read_parameter(
             NetworkParameter.trust_center_address
-        ]
+        )
 
-        (_, network_info.tc_link_key.key) = await self._api.read_parameter(
+        link_key = await self._api.read_parameter(
             NetworkParameter.link_key,
             network_info.tc_link_key.partner_ieee,
         )
+        network_info.tc_link_key.key = link_key.key
 
-        (security_mode,) = await self._api[NetworkParameter.security_mode]
+        security_mode = await self._api.read_parameter(NetworkParameter.security_mode)
 
         if security_mode == SecurityMode.NO_SECURITY:
             network_info.security_level = 0x00
@@ -333,7 +387,54 @@ class ControllerApplication(zigpy.application.ControllerApplication):
 
     async def force_remove(self, dev):
         """Forcibly remove device from NCP."""
-        pass
+
+    async def energy_scan(
+        self, channels: t.Channels.ALL_CHANNELS, duration_exp: int, count: int
+    ) -> dict[int, float]:
+        if self._api.firmware_version.platform in (
+            FirmwarePlatform.Conbee,
+            FirmwarePlatform.Conbee_II,
+        ):
+            results = await super().energy_scan(
+                channels=channels, duration_exp=duration_exp, count=count
+            )
+
+            # The Conbee I/II seems to max out at an LQI of 85, which is exactly 255/3
+            return {c: v * 3 for c, v in results.items()}
+
+        for i in range(CONBEE_III_ENERGY_SCAN_ATTEMPTS):
+            # The Conbee III energy scan inherits the EmberZNet ZDO bug
+            try:
+                rsp = await self._device.zdo.Mgmt_NWK_Update_req(
+                    zigpy.zdo.types.NwkUpdate(
+                        ScanChannels=channels,
+                        ScanDuration=duration_exp,
+                        ScanCount=count,
+                    )
+                )
+                break
+            except (asyncio.TimeoutError, zigpy.exceptions.DeliveryError):
+                if i == CONBEE_III_ENERGY_SCAN_ATTEMPTS - 1:
+                    raise
+
+                continue
+
+        _, scanned_channels, _, _, energy_values = rsp
+        return dict(zip(scanned_channels, energy_values))
+
+    async def _move_network_to_channel(
+        self, new_channel: int, new_nwk_update_id: int
+    ) -> None:
+        """Move device to a new channel."""
+        channel_mask = zigpy.types.Channels.from_channel_list([new_channel])
+        await self._api.write_parameter(NetworkParameter.channel_mask, channel_mask)
+        await self._api.write_parameter(
+            NetworkParameter.nwk_update_id, new_nwk_update_id
+        )
+
+        await self._change_network_state(NetworkState.OFFLINE)
+        await asyncio.sleep(CHANGE_NETWORK_STATE_DELAY)
+        await self._change_network_state(NetworkState.CONNECTED)
 
     async def add_endpoint(self, descriptor: zdo_t.SimpleDescriptor) -> None:
         """Register an endpoint on the device, replacing any with conflicting IDs."""
@@ -343,14 +444,14 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         # Read and count the current endpoints. Some firmwares have three, others four.
         for index in range(255 + 1):
             try:
-                _, current_descriptor = await self._api.read_parameter(
+                current_descriptor = await self._api.read_parameter(
                     NetworkParameter.configure_endpoint, index
                 )
             except zigpy_deconz.exception.CommandError as ex:
                 assert ex.status == Status.UNSUPPORTED
                 break
             else:
-                endpoints[index] = current_descriptor
+                endpoints[index] = current_descriptor.descriptor
 
         LOGGER.debug("Got endpoint slots: %r", endpoints)
 
@@ -382,227 +483,56 @@ class ControllerApplication(zigpy.application.ControllerApplication):
         LOGGER.debug("Writing %s to slot %r", descriptor, target_index)
 
         await self._api.write_parameter(
-            NetworkParameter.configure_endpoint, target_index, descriptor
+            NetworkParameter.configure_endpoint,
+            IndexedEndpoint(index=target_index, descriptor=descriptor),
         )
 
-    @contextlib.asynccontextmanager
-    async def _limit_concurrency(self):
-        """Async context manager to prevent devices from being overwhelmed by requests.
-
-        Mainly a thin wrapper around `asyncio.Semaphore` that logs when it has to wait.
-        """
-
-        start_time = time.time()
-        was_locked = self._concurrent_requests_semaphore.locked()
-
-        if was_locked:
-            self._currently_waiting_requests += 1
-            LOGGER.debug(
-                "Max concurrency (%s) reached, delaying requests (%s enqueued)",
-                self._config[CONF_DECONZ_CONFIG][CONF_MAX_CONCURRENT_REQUESTS],
-                self._currently_waiting_requests,
-            )
-
-        try:
-            async with self._concurrent_requests_semaphore:
-                if was_locked:
-                    LOGGER.debug(
-                        "Previously delayed request is now running, "
-                        "delayed by %0.2f seconds",
-                        time.time() - start_time,
-                    )
-
-                yield
-        finally:
-            if was_locked:
-                self._currently_waiting_requests -= 1
-
-    async def mrequest(
-        self,
-        group_id,
-        profile,
-        cluster,
-        src_ep,
-        sequence,
-        data,
-        *,
-        hops=0,
-        non_member_radius=3,
-    ):
-        """Submit and send data out as a multicast transmission.
-
-        :param group_id: destination multicast address
-        :param profile: Zigbee Profile ID to use for outgoing message
-        :param cluster: cluster id where the message is being sent
-        :param src_ep: source endpoint id
-        :param sequence: transaction sequence number of the message
-        :param data: Zigbee message payload
-        :param hops: the message will be delivered to all nodes within this number of
-                     hops of the sender. A value of zero is converted to MAX_HOPS
-        :param non_member_radius: the number of hops that the message will be forwarded
-                                  by devices that are not members of the group. A value
-                                  of 7 or greater is treated as infinite
-        :returns: return a tuple of a status and an error_message. Original requestor
-                  has more context to provide a more meaningful error message
-        """
-        req_id = self.get_sequence()
-        LOGGER.debug(
-            "Sending Zigbee multicast with tsn %s under %s request id, data: %s",
-            sequence,
-            req_id,
-            binascii.hexlify(data),
-        )
-        dst_addr_ep = t.DeconzAddressEndpoint()
-        dst_addr_ep.address_mode = t.ADDRESS_MODE.GROUP
-        dst_addr_ep.address = group_id
-
-        async with self._limit_concurrency():
-            with self._pending.new(req_id) as req:
-                try:
-                    await self._api.aps_data_request(
-                        req_id, dst_addr_ep, profile, cluster, min(1, src_ep), data
-                    )
-                except zigpy_deconz.exception.CommandError as ex:
-                    return ex.status, f"Couldn't enqueue send data request: {ex!r}"
-
-                r = await asyncio.wait_for(req.result, SEND_CONFIRM_TIMEOUT)
-                if r:
-                    LOGGER.debug("Error while sending %s req id frame: %s", req_id, r)
-                    return r, f"message send failure: {r}"
-
-            return Status.SUCCESS, "message send success"
-
-    @zigpy.util.retryable_request
-    async def request(
-        self,
-        device,
-        profile,
-        cluster,
-        src_ep,
-        dst_ep,
-        sequence,
-        data,
-        expect_reply=True,
-        use_ieee=False,
-    ):
-        req_id = self.get_sequence()
-        LOGGER.debug(
-            "Sending Zigbee request with tsn %s under %s request id, data: %s",
-            sequence,
-            req_id,
-            binascii.hexlify(data),
-        )
-        dst_addr_ep = t.DeconzAddressEndpoint()
-        dst_addr_ep.endpoint = t.uint8_t(dst_ep)
-        if use_ieee:
-            dst_addr_ep.address_mode = t.uint8_t(t.ADDRESS_MODE.IEEE)
-            dst_addr_ep.address = device.ieee
-        else:
-            dst_addr_ep.address_mode = t.uint8_t(t.ADDRESS_MODE.NWK)
-            dst_addr_ep.address = device.nwk
+    async def send_packet(self, packet):
+        LOGGER.debug("Sending packet: %r", packet)
 
         tx_options = t.DeconzTransmitOptions.USE_NWK_KEY_SECURITY
 
-        async with self._limit_concurrency():
+        if (
+            zigpy.types.TransmitOptions.ACK in packet.tx_options
+            and packet.dst.addr_mode
+            in (zigpy.types.AddrMode.NWK, zigpy.types.AddrMode.IEEE)
+        ):
+            tx_options |= t.DeconzTransmitOptions.USE_APS_ACKS
+
+        async with self._limit_concurrency(priority=packet.priority):
+            req_id = self.get_sequence()
+
             with self._pending.new(req_id) as req:
                 try:
                     await self._api.aps_data_request(
-                        req_id,
-                        dst_addr_ep,
-                        profile,
-                        cluster,
-                        min(1, src_ep),
-                        data,
+                        req_id=req_id,
+                        dst_addr_ep=t.DeconzAddressEndpoint.from_zigpy_type(
+                            packet.dst, packet.dst_ep or 0
+                        ),
+                        profile=packet.profile_id,
+                        cluster=packet.cluster_id,
+                        src_ep=min(1, packet.src_ep),
+                        aps_payload=packet.data.serialize(),
                         tx_options=tx_options,
+                        relays=packet.source_route,
+                        radius=packet.radius or 0,
                     )
                 except zigpy_deconz.exception.CommandError as ex:
-                    return ex.status, f"Couldn't enqueue send data request: {ex!r}"
-
-                r = await asyncio.wait_for(req.result, SEND_CONFIRM_TIMEOUT)
-
-                if r:
-                    LOGGER.debug("Error while sending %s req id frame: %s", req_id, r)
-                    return r, "message send failure"
-
-                return r, "message send success"
-
-    async def broadcast(
-        self,
-        profile,
-        cluster,
-        src_ep,
-        dst_ep,
-        grpid,
-        radius,
-        sequence,
-        data,
-        broadcast_address=zigpy.types.BroadcastAddress.RX_ON_WHEN_IDLE,
-    ):
-        req_id = self.get_sequence()
-        LOGGER.debug(
-            "Sending Zigbee broadcast with tsn %s under %s request id, data: %s",
-            sequence,
-            req_id,
-            binascii.hexlify(data),
-        )
-        dst_addr_ep = t.DeconzAddressEndpoint()
-        dst_addr_ep.address_mode = t.uint8_t(t.ADDRESS_MODE.NWK.value)
-        dst_addr_ep.address = t.uint16_t(broadcast_address)
-        dst_addr_ep.endpoint = dst_ep
-
-        async with self._limit_concurrency():
-            with self._pending.new(req_id) as req:
-                try:
-                    await self._api.aps_data_request(
-                        req_id, dst_addr_ep, profile, cluster, min(1, src_ep), data
-                    )
-                except zigpy_deconz.exception.CommandError as ex:
-                    return (
-                        ex.status,
-                        f"Couldn't enqueue send data request for broadcast: {ex!r}",
+                    raise zigpy.exceptions.DeliveryError(
+                        f"Failed to enqueue packet: {ex!r}", ex.status
                     )
 
-                r = await asyncio.wait_for(req.result, SEND_CONFIRM_TIMEOUT)
+                async with asyncio_timeout(SEND_CONFIRM_TIMEOUT):
+                    status = await req.result
 
-                if r:
-                    LOGGER.debug(
-                        "Error while sending %s req id broadcast: %s", req_id, r
+                if status != TXStatus.SUCCESS:
+                    raise zigpy.exceptions.DeliveryError(
+                        f"Failed to deliver packet: {status!r}", status
                     )
-                    return r, f"broadcast send failure: {r}"
-                return r, "broadcast send success"
 
     async def permit_ncp(self, time_s=60):
         assert 0 <= time_s <= 254
         await self._api.write_parameter(NetworkParameter.permit_join, time_s)
-
-    def handle_rx(
-        self, src_addr, src_ep, dst_ep, profile_id, cluster_id, data, lqi, rssi
-    ):
-        # intercept ZDO device announce frames
-        if dst_ep == 0 and cluster_id == 0x13:
-            nwk, rest = t.uint16_t.deserialize(data[1:])
-            ieee, _ = zigpy.types.EUI64.deserialize(rest)
-            LOGGER.info("New device joined: 0x%04x, %s", nwk, ieee)
-            self.handle_join(nwk, ieee, 0)
-
-        try:
-            if src_addr.address_mode == t.ADDRESS_MODE.NWK_AND_IEEE:
-                device = self.get_device(ieee=src_addr.ieee)
-            elif src_addr.address_mode == t.ADDRESS_MODE.NWK.value:
-                device = self.get_device(nwk=src_addr.address)
-            elif src_addr.address_mode == t.ADDRESS_MODE.IEEE.value:
-                device = self.get_device(ieee=src_addr.address)
-            else:
-                raise Exception(
-                    "Unsupported address mode in handle_rx: %s"
-                    % (src_addr.address_mode)
-                )
-        except KeyError:
-            LOGGER.debug("Received frame from unknown device: 0x%04x", src_addr.address)
-            return
-
-        device.radio_details(lqi, rssi)
-        self.handle_message(device, profile_id, cluster_id, src_ep, dst_ep, data)
 
     def handle_tx_confirm(self, req_id, status):
         try:
@@ -622,10 +552,13 @@ class ControllerApplication(zigpy.application.ControllerApplication):
     async def restore_neighbours(self) -> None:
         """Restore children."""
         coord = self.get_device(ieee=self.state.node_info.ieee)
-        devices = (nei.device for nei in coord.neighbors)
-        for device in devices:
-            if device is None:
+
+        for neighbor in self.topology.neighbors[coord.ieee]:
+            try:
+                device = self.get_device(ieee=neighbor.ieee)
+            except KeyError:
                 continue
+
             descr = device.node_desc
             LOGGER.debug(
                 "device: 0x%04x - %s %s, FFD=%s, Rx_on_when_idle=%s",
@@ -641,71 +574,34 @@ class ControllerApplication(zigpy.application.ControllerApplication):
                 or descr.is_receiver_on_when_idle
             ):
                 continue
-            LOGGER.debug(
-                "Restoring %s/0x%04x device as direct child",
-                device.ieee,
-                device.nwk,
-            )
-            await self._api.add_neighbour(
-                0x01, device.nwk, device.ieee, descr.mac_capability_flags
-            )
+
+            LOGGER.debug("Restoring %s as direct child", device)
+
+            try:
+                await self._api.add_neighbour(
+                    nwk=device.nwk,
+                    ieee=device.ieee,
+                    mac_capability_flags=descr.mac_capability_flags,
+                )
+            except zigpy_deconz.exception.CommandError as ex:
+                assert ex.status == Status.FAILURE
+                LOGGER.debug("Failed to add device to neighbor table: %s", ex)
 
     async def _delayed_neighbour_scan(self) -> None:
         """Scan coordinator's neighbours."""
         await asyncio.sleep(DELAY_NEIGHBOUR_SCAN_S)
         coord = self.get_device(ieee=self.state.node_info.ieee)
-        await coord.neighbors.scan()
-
-    def connection_lost(self, exc: Exception) -> None:
-        """Lost connection."""
-
-        if exc is not None:
-            LOGGER.warning("Lost connection: %r", exc)
-
-        self.close()
-        self._reconnect_task = asyncio.create_task(self._reconnect_loop())
-
-    async def _reconnect_loop(self) -> None:
-        attempt = 1
-
-        while True:
-            LOGGER.debug("Reconnecting, attempt %s", attempt)
-
-            try:
-                await asyncio.wait_for(self.connect(), timeout=10)
-                await asyncio.wait_for(self.initialize(), timeout=10)
-                break
-            except Exception as exc:
-                wait = 2 ** min(attempt, 5)
-                attempt += 1
-                LOGGER.debug(
-                    "Couldn't re-open '%s' serial port, retrying in %ss: %s",
-                    self._config[zigpy.config.CONF_DEVICE][
-                        zigpy.config.CONF_DEVICE_PATH
-                    ],
-                    wait,
-                    str(exc),
-                    exc_info=exc,
-                )
-                await asyncio.sleep(wait)
-
-        LOGGER.debug(
-            "Reconnected '%s' serial port after %s attempts",
-            self._config[zigpy.config.CONF_DEVICE][zigpy.config.CONF_DEVICE_PATH],
-            attempt,
-        )
+        await self.topology.scan(devices=[coord])
 
 
 class DeconzDevice(zigpy.device.Device):
     """Zigpy Device representing Coordinator."""
 
-    def __init__(self, version: int, device_path: str, *args):
+    def __init__(self, model: str, *args):
         """Initialize instance."""
 
         super().__init__(*args)
-        is_gpio_device = re.match(r"/dev/tty(S|AMA|ACM)\d+", device_path)
-        self._model = "RaspBee" if is_gpio_device else "ConBee"
-        self._model += " II" if ((version & 0x0000FF00) == 0x00000700) else ""
+        self._model = model
 
     async def add_to_group(self, grp_id: int, name: str = None) -> None:
         group = self.application.groups.add_group(grp_id, name)
@@ -732,17 +628,14 @@ class DeconzDevice(zigpy.device.Device):
         return self._model
 
     @classmethod
-    async def new(cls, application, ieee, nwk, version: int, device_path: str):
+    async def new(cls, application, ieee, nwk, model: str):
         """Create or replace zigpy device."""
-        dev = cls(version, device_path, application, ieee, nwk)
+        dev = cls(model, application, ieee, nwk)
 
         if ieee in application.devices:
             from_dev = application.get_device(ieee=ieee)
             dev.status = from_dev.status
             dev.node_desc = from_dev.node_desc
-            dev.neighbors = zigpy.neighbor.Neighbors(dev)
-            for nei in from_dev.neighbors.neighbors:
-                dev.neighbors.add_neighbor(nei.neighbor)
             for ep_id, from_ep in from_dev.endpoints.items():
                 if not ep_id:
                     continue  # Skip ZDO

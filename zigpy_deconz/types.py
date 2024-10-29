@@ -1,18 +1,64 @@
 """Data types module."""
 
-import enum
+
+import zigpy.types as zigpy_t
+from zigpy.types import (  # noqa: F401
+    EUI64,
+    NWK,
+    ExtendedPanId,
+    LongOctetString,
+    LVBytes,
+    LVList,
+    PanId,
+    Struct,
+    bitmap3,
+    bitmap5,
+    bitmap6,
+    bitmap8,
+    bitmap16,
+    enum2,
+    enum3,
+    enum8,
+    int8s,
+    uint8_t,
+    uint16_t,
+    uint32_t,
+    uint64_t,
+)
 
 
-def deserialize(data, schema):
-    result = []
-    for type_ in schema:
-        value, data = type_.deserialize(data)
-        result.append(value)
+def serialize_dict(data, schema):
+    chunks = []
+
+    for key in schema:
+        value = data[key]
+        if value is None:
+            break
+
+        if not isinstance(value, schema[key]):
+            value = schema[key](value)
+
+        chunks.append(value.serialize())
+
+    return b"".join(chunks)
+
+
+def deserialize_dict(data, schema):
+    result = {}
+    for name, type_ in schema.items():
+        try:
+            result[name], data = type_.deserialize(data)
+        except ValueError:
+            if data:
+                raise
+
+            result[name] = None
     return result, data
 
 
-def serialize(data, schema):
-    return b"".join(t(v).serialize() for t, v in zip(schema, data))
+def list_replace(lst: list, old: object, new: object) -> list:
+    """Replace all occurrences of `old` with `new` in `lst`."""
+    return [new if x == old else x for x in lst]
 
 
 class Bytes(bytes):
@@ -24,133 +70,13 @@ class Bytes(bytes):
         return cls(data), b""
 
 
-class LVBytes(bytes):
-    def serialize(self):
-        return uint16_t(len(self)).serialize() + self
-
-    @classmethod
-    def deserialize(cls, data, byteorder="little"):
-        length, data = uint16_t.deserialize(data)
-        return cls(data[:length]), data[length:]
-
-
-class int_t(int):
-    _signed = True
-    _size = 0
-
-    def serialize(self, byteorder="little"):
-        return self.to_bytes(self._size, byteorder, signed=self._signed)
-
-    @classmethod
-    def deserialize(cls, data, byteorder="little"):
-        # Work around https://bugs.python.org/issue23640
-        r = cls(int.from_bytes(data[: cls._size], byteorder, signed=cls._signed))
-        data = data[cls._size :]
-        return r, data
-
-
-class int8s(int_t):
-    _size = 1
-
-
-class int16s(int_t):
-    _size = 2
-
-
-class int24s(int_t):
-    _size = 3
-
-
-class int32s(int_t):
-    _size = 4
-
-
-class int40s(int_t):
-    _size = 5
-
-
-class int48s(int_t):
-    _size = 6
-
-
-class int56s(int_t):
-    _size = 7
-
-
-class int64s(int_t):
-    _size = 8
-
-
-class uint_t(int_t):
-    _signed = False
-
-
-class uint8_t(uint_t):
-    _size = 1
-
-
-class uint16_t(uint_t):
-    _size = 2
-
-
-class uint24_t(uint_t):
-    _size = 3
-
-
-class uint32_t(uint_t):
-    _size = 4
-
-
-class uint40_t(uint_t):
-    _size = 5
-
-
-class uint48_t(uint_t):
-    _size = 6
-
-
-class uint56_t(uint_t):
-    _size = 7
-
-
-class uint64_t(uint_t):
-    _size = 8
-
-
-class ADDRESS_MODE(uint8_t, enum.Enum):
+class AddressMode(enum8):
     # Address modes used in deconz protocol
 
     GROUP = 0x01
     NWK = 0x02
     IEEE = 0x03
     NWK_AND_IEEE = 0x04
-
-
-def bitmap_factory(int_type: uint_t) -> enum.Flag:
-    class _NewEnum(int_type, enum.Flag):
-        # Rebind classmethods to our own class
-        _missing_ = classmethod(enum.IntFlag._missing_.__func__)
-        _create_pseudo_member_ = classmethod(
-            enum.IntFlag._create_pseudo_member_.__func__
-        )
-
-        __or__ = enum.IntFlag.__or__
-        __and__ = enum.IntFlag.__and__
-        __xor__ = enum.IntFlag.__xor__
-        __ror__ = enum.IntFlag.__ror__
-        __rand__ = enum.IntFlag.__rand__
-        __rxor__ = enum.IntFlag.__rxor__
-        __invert__ = enum.IntFlag.__invert__
-
-    return _NewEnum
-
-
-class bitmap8(bitmap_factory(uint8_t)):
-    pass
-
-
-class bitmap16(bitmap_factory(uint16_t)):
-    pass
 
 
 class DeconzSendDataFlags(bitmap8):
@@ -167,205 +93,145 @@ class DeconzTransmitOptions(bitmap8):
     ALLOW_FRAGMENTATION = 0x08
 
 
-class Struct:
-    _fields = []
-
-    def __init__(self, *args, **kwargs):
-        """Initialize instance."""
-
-        if len(args) == 1 and isinstance(args[0], self.__class__):
-            # copy constructor
-            for field in self._fields:
-                if hasattr(args[0], field[0]):
-                    setattr(self, field[0], getattr(args[0], field[0]))
-
-    def serialize(self):
-        r = b""
-        for field in self._fields:
-            if hasattr(self, field[0]):
-                r += getattr(self, field[0]).serialize()
-        return r
-
-    @classmethod
-    def deserialize(cls, data):
-        """Deserialize data."""
-        r = cls()
-        for field_name, field_type in cls._fields:
-            v, data = field_type.deserialize(data)
-            setattr(r, field_name, v)
-        return r, data
-
-    def __repr__(self):
-        """Instance representation."""
-        r = "<%s " % (self.__class__.__name__,)
-        r += " ".join(
-            ["%s=%s" % (f[0], getattr(self, f[0], None)) for f in self._fields]
-        )
-        r += ">"
-        return r
-
-
-class List(list):
-    _length = None
-    _itemtype = None
-
-    def serialize(self):
-        assert self._length is None or len(self) == self._length
-        return b"".join([self._itemtype(i).serialize() for i in self])
-
-    @classmethod
-    def deserialize(cls, data):
-        assert cls._itemtype is not None
-        r = cls()
-        while data:
-            item, data = cls._itemtype.deserialize(data)
-            r.append(item)
-        return r, data
-
-
-class LVList(list):
-    _length_type = None
-    _itemtype = None
-
-    def serialize(self):
-        return self._length_type(len(self)).serialize() + b"".join(
-            [self._itemtype(i).serialize() for i in self]
-        )
-
-    @classmethod
-    def deserialize(cls, data):
-        length, data = cls._length_type.deserialize(data)
-        r = cls()
-        for _ in range(length):
-            item, data = cls._itemtype.deserialize(data)
-            r.append(item)
-        return r, data
-
-
-class FixedList(List):
-    _length = None
-    _itemtype = None
-
-    @classmethod
-    def deserialize(cls, data):
-        assert cls._itemtype is not None
-        r = cls()
-        for i in range(cls._length):
-            item, data = cls._itemtype.deserialize(data)
-            r.append(item)
-        return r, data
-
-
-class EUI64(FixedList):
-    _length = 8
-    _itemtype = uint8_t
-
-    def __repr__(self):
-        """Instance representation."""
-        return ":".join("%02x" % i for i in self[::-1])
-
-    def __hash__(self):
-        """Hash magic method."""
-        return hash(repr(self))
-
-
-class HexRepr:
-    def __repr__(self):
-        """Instance representation."""
-        return ("0x{:0" + str(self._size * 2) + "x}").format(self)
-
-    def __str__(self):
-        """Instance str method."""
-        return ("0x{:0" + str(self._size * 2) + "x}").format(self)
-
-
-class GroupId(HexRepr, uint16_t):
-    pass
-
-
-class NWK(HexRepr, uint16_t):
-    pass
-
-
-class PanId(HexRepr, uint16_t):
-    pass
-
-
-class ExtendedPanId(EUI64):
-    pass
-
-
 class NWKList(LVList):
     _length_type = uint8_t
-    _itemtype = NWK
+    _item_type = NWK
+
+
+ZIGPY_ADDR_MODE_MAPPING = {
+    zigpy_t.AddrMode.NWK: AddressMode.NWK,
+    zigpy_t.AddrMode.IEEE: AddressMode.IEEE,
+    zigpy_t.AddrMode.Group: AddressMode.GROUP,
+    zigpy_t.AddrMode.Broadcast: AddressMode.NWK,
+}
+
+
+ZIGPY_ADDR_TYPE_MAPPING = {
+    zigpy_t.AddrMode.NWK: NWK,
+    zigpy_t.AddrMode.IEEE: EUI64,
+    zigpy_t.AddrMode.Group: NWK,
+    zigpy_t.AddrMode.Broadcast: NWK,
+}
+
+
+ZIGPY_ADDR_MODE_REVERSE_MAPPING = {
+    AddressMode.NWK: zigpy_t.AddrMode.NWK,
+    AddressMode.IEEE: zigpy_t.AddrMode.IEEE,
+    AddressMode.GROUP: zigpy_t.AddrMode.Group,
+    AddressMode.NWK_AND_IEEE: zigpy_t.AddrMode.IEEE,
+}
+
+
+ZIGPY_ADDR_TYPE_REVERSE_MAPPING = {
+    AddressMode.NWK: zigpy_t.NWK,
+    AddressMode.IEEE: zigpy_t.EUI64,
+    AddressMode.GROUP: zigpy_t.Group,
+    AddressMode.NWK_AND_IEEE: zigpy_t.NWK,
+}
 
 
 class DeconzAddress(Struct):
-    _fields = [
-        # The address format (AddressMode)
-        ("address_mode", ADDRESS_MODE),
-        ("address", EUI64),
-    ]
+    address_mode: AddressMode
+    address: EUI64
+    ieee: EUI64
 
     @classmethod
     def deserialize(cls, data):
         r = cls()
-        mode, data = ADDRESS_MODE.deserialize(data)
+        mode, data = AddressMode.deserialize(data)
         r.address_mode = mode
-        if mode in [ADDRESS_MODE.GROUP, ADDRESS_MODE.NWK, ADDRESS_MODE.NWK_AND_IEEE]:
+        if mode in [AddressMode.GROUP, AddressMode.NWK, AddressMode.NWK_AND_IEEE]:
             r.address, data = NWK.deserialize(data)
-        elif mode == ADDRESS_MODE.IEEE:
+        elif mode == AddressMode.IEEE:
             r.address, data = EUI64.deserialize(data)
-        if mode == ADDRESS_MODE.NWK_AND_IEEE:
+        if mode == AddressMode.NWK_AND_IEEE:
             r.ieee, data = EUI64.deserialize(data)
         return r, data
 
     def serialize(self):
-        r = super().serialize()
-        if self.address_mode == ADDRESS_MODE.NWK_AND_IEEE:
+        r = self.address_mode.serialize() + self.address.serialize()
+        if self.address_mode == AddressMode.NWK_AND_IEEE:
             r += self.ieee.serialize()
         return r
 
+    def as_zigpy_type(self):
+        addr_mode = ZIGPY_ADDR_MODE_REVERSE_MAPPING[self.address_mode]
+        address = ZIGPY_ADDR_TYPE_REVERSE_MAPPING[self.address_mode](self.address)
+
+        if self.address_mode == AddressMode.NWK and self.address > 0xFFF7:
+            addr_mode = zigpy_t.AddrMode.Broadcast
+            address = zigpy_t.BroadcastAddress(self.address)
+        elif self.address_mode == AddressMode.NWK_AND_IEEE:
+            address = zigpy_t.EUI64(self.ieee)
+
+        return zigpy_t.AddrModeAddress(
+            addr_mode=addr_mode,
+            address=address,
+        )
+
+    @classmethod
+    def from_zigpy_type(cls, addr):
+        instance = cls()
+        instance.address_mode = ZIGPY_ADDR_MODE_MAPPING[addr.addr_mode]
+        instance.address = ZIGPY_ADDR_TYPE_MAPPING[addr.addr_mode](addr.address)
+
+        return instance
+
 
 class DeconzAddressEndpoint(Struct):
-    _fields = [
-        # The address format (AddressMode)
-        ("address_mode", ADDRESS_MODE),
-        ("address", EUI64),
-        ("endpoint", uint8_t),
-    ]
+    address_mode: AddressMode
+    address: EUI64
+    ieee: EUI64
+    endpoint: uint8_t
 
     @classmethod
     def deserialize(cls, data):
-        r = cls()
-        mode, data = ADDRESS_MODE.deserialize(data)
-        r.address_mode = mode
-        a = e = None
-        if mode == ADDRESS_MODE.GROUP:
-            a, data = GroupId.deserialize(data)
-        elif mode == ADDRESS_MODE.NWK:
-            a, data = NWK.deserialize(data)
-        elif mode == ADDRESS_MODE.IEEE:
-            a, data = EUI64.deserialize(data)
-        setattr(r, cls._fields[1][0], a)
-        if mode in [ADDRESS_MODE.NWK, ADDRESS_MODE.IEEE]:
-            e, data = uint8_t.deserialize(data)
-        setattr(r, cls._fields[2][0], e)
+        r, data = DeconzAddress.deserialize.__func__(cls, data)
+
+        if r.address_mode in (
+            AddressMode.NWK,
+            AddressMode.IEEE,
+            AddressMode.NWK_AND_IEEE,
+        ):
+            r.endpoint, data = uint8_t.deserialize(data)
+        else:
+            r.endpoint = None
+
         return r, data
 
     def serialize(self):
         r = uint8_t(self.address_mode).serialize()
-        if self.address_mode == ADDRESS_MODE.NWK:
+
+        if self.address_mode in (AddressMode.NWK, AddressMode.NWK_AND_IEEE):
             r += NWK(self.address).serialize()
-        elif self.address_mode == ADDRESS_MODE.GROUP:
-            r += GroupId(self.address).serialize()
-        elif self.address_mode == ADDRESS_MODE.IEEE:
+        elif self.address_mode == AddressMode.GROUP:
+            r += NWK(self.address).serialize()
+
+        if self.address_mode in (AddressMode.IEEE, AddressMode.NWK_AND_IEEE):
             r += EUI64(self.address).serialize()
-        if self.address_mode in (ADDRESS_MODE.NWK, ADDRESS_MODE.IEEE):
+
+        if self.address_mode in (
+            AddressMode.NWK,
+            AddressMode.IEEE,
+            AddressMode.NWK_AND_IEEE,
+        ):
             r += uint8_t(self.endpoint).serialize()
+
         return r
 
+    @classmethod
+    def from_zigpy_type(cls, addr, endpoint):
+        temp_addr = DeconzAddress.from_zigpy_type(addr)
 
-class Key(FixedList):
-    _itemtype = uint8_t
-    _length = 16
+        instance = cls()
+        instance.address_mode = temp_addr.address_mode
+        instance.address = temp_addr.address
+        instance.endpoint = endpoint
+
+        return instance
+
+
+class DataIndicationFlags(bitmap8):
+    Always_Use_NWK_Source_Addr = 0b00000001
+    Last_Hop_In_Reserved_Bytes = 0b00000010
+    Include_Both_NWK_And_IEEE = 0b00000100
